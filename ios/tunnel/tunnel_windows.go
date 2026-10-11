@@ -91,8 +91,16 @@ func (t *tunWrapper) Read(p []byte) (int, error) {
 
 }
 
+// setupTunnelInterface creates the wintun adapter and assigns the tunnel
+// address to it. The adapter name defaults to "tun0" (upstream behavior);
+// GO_IOS_TUN_NAME overrides it, which lets several isolated tunnel agents run
+// side by side on one Windows host — otherwise every agent targets the same
+// adapter name and its netsh commands clobber each other's address.
 func setupTunnelInterface(tunnelInfo tunnelParameters) (io.ReadWriteCloser, error) {
 	name := "tun0"
+	if v := os.Getenv("GO_IOS_TUN_NAME"); v != "" {
+		name = v
+	}
 
 	tunDevice, err := CreateTUN(name, int(tunnelInfo.ClientParameters.Mtu))
 	if err != nil {
