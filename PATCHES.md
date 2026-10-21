@@ -16,6 +16,32 @@ of the exact upstream commit we depend on.
 - Patch: read `GO_IOS_TUN_NAME` (default stays `tun0` when unset/empty). The agent
   launcher assigns a unique name per instance (e.g. `oss27tun3`).
 
+### 2. Raw attribute query + full element dict passthrough (`ios/accessibility/accessibility_control.go`)
+
+- Purpose: protocol reconnaissance for on-screen rect retrieval by element
+  handle (`deviceElement:valueForAttribute:`). Adds:
+  - `QueryAttributeValueRaw` — returns the raw response value, unwrapping
+    archived objects (`[]byte` via `nskeyedarchiver`) instead of dropping
+    non-string values on the floor; `QueryAttributeValue` (string) now
+    delegates to it with identical behavior for existing callers.
+  - `QueryElementRect` — probes candidate attribute names, feeds each raw
+    value through `tryExtractRect` (ax_rect.go).
+  - `AXElementData.Attributes` — the full element dict from Move events
+    (upstream kept only SpokenDescription + handle); `AXElementData.Rect()`
+    extracts a frame from the known `*Value_v1` key family if present.
+- **Negative result, verified on device (iOS 27.0.1, 2026-10-21): this
+  protocol has NO rect attribute.** The Move-event dict carries only four
+  keys (SpokenDescriptionValue_v1 / ElementValue_v1 = handle / 
+  CaptionTextValue_v1 / InspectorSectionsValue_v1 = attribute *metadata*),
+  and the valueForAttribute attribute universe is exactly
+  `Identifier / Label / Traits / TraitsHumanReadable / Value` — no frame.
+  Device-native rects exist only in the audit stream, attached to
+  accessibility-*issue* elements (a small subset), not the full tree.
+- Status: compiled + device-verified; **not consumed** by avatarclaw's
+  agent, go.mod not re-pinned (no consumer yet). Kept so the protocol
+  question stays answered and the tooling is one re-pin away.
+  Context: avatarclaw repo `docs/superpowers/plans/2026-10-21-oss27-smart-precision.md`.
+
 ## Maintenance
 
 - Upstream sync: rebase this branch onto the next upstream commit we pin, resolve,

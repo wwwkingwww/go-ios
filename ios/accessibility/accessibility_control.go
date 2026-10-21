@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"time"
 
 	dtx "github.com/danielpaulus/go-ios/ios/dtx_codec"
 	"github.com/danielpaulus/go-ios/ios/golog"
@@ -74,6 +75,24 @@ const (
 type AXElementData struct {
 	PlatformElementValue string `json:"platformElementValue"` // Base64-encoded platform element data
 	SpokenDescription    string `json:"spokenDescription"`    // Spoken description of the element
+	// Attributes carries the full element dict from the Move event (oss27
+	// fork patch #2). Upstream only surfaces SpokenDescription+handle and
+	// drops the rest; rect-like fields (ElementRectValue_v1 family) live here.
+	Attributes map[string]interface{} `json:"attributes,omitempty"`
+}
+
+// Rect returns the on-screen frame {x,y,width,height} of the element if the
+// Move event carried one (ElementRectValue_v1 family), via tryExtractRect.
+func (d AXElementData) Rect() (map[string]float64, bool) {
+	for _, key := range []string{"ElementRectValue_v1", "ElementRect",
+		"FrameValue_v1", "Frame", "AXFrame"} {
+		if v, ok := d.Attributes[key]; ok {
+			if rect, ok := tryExtractRect(v); ok {
+				return rect, true
+			}
+		}
+	}
+	return nil, false
 }
 
 func (a *ControlInterface) readhostAppStateChanged(ctx context.Context) {
@@ -261,6 +280,7 @@ func (a *ControlInterface) parseElementResponse(resp map[string]interface{}) (AX
 	return AXElementData{
 		PlatformElementValue: base64.StdEncoding.EncodeToString(platformElementBytes),
 		SpokenDescription:    spokenDescription,
+		Attributes:           innerValue,
 	}, nil
 }
 
@@ -294,7 +314,51 @@ func (a *ControlInterface) QueryAttributeValue(ctx context.Context, platformElem
 	return a.queryAttributeValue(ctx, platformElementBytes, attributeName)
 }
 
+// QueryAttributeValueRaw queries an attribute and returns the raw response
+// value without forcing it to a string. Rect-like attributes come back as
+// archived objects (NSValue/NSDictionary), not strings, so the string-only
+// path drops them on the floor. Use tryExtractRect (ax_rect.go) on the
+// result for frame attributes. (oss27 fork patch #2)
+func (a *ControlInterface) QueryAttributeValueRaw(ctx context.Context, platformElementValue string, attributeName string) (interface{}, bool, error) {
+	platformElementBytes, err := base64.StdEncoding.DecodeString(platformElementValue)
+	if err != nil {
+		return nil, false, fmt.Errorf("invalid platformElementValue base64: %w", err)
+	}
+	return a.queryAttributeValueRaw(ctx, platformElementBytes, attributeName)
+}
+
+// QueryElementRect queries the on-screen frame of an element by handle.
+// Candidate attribute names are probed in order (Apple's AX service has used
+// different names across iOS versions); first extractable rect wins.
+// (oss27 fork patch #2)
+func (a *ControlInterface) QueryElementRect(ctx context.Context, platformElementValue string) (map[string]float64, bool) {
+	for _, attr := range []string{"AXFrame", "Frame", "ElementRect", "Rect", "frame"} {
+		qCtx, qCancel := context.WithTimeout(ctx, 3*time.Second)
+		raw, ok, err := a.QueryAttributeValueRaw(qCtx, platformElementValue, attr)
+		qCancel()
+		if err != nil || !ok {
+			continue
+		}
+		if rect, ok := tryExtractRect(raw); ok {
+			return rect, true
+		}
+	}
+	return nil, false
+}
+
 func (a *ControlInterface) queryAttributeValue(ctx context.Context, platformElementBytes []byte, attributeName string) (string, error) {
+	raw, ok, err := a.queryAttributeValueRaw(ctx, platformElementBytes, attributeName)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", nil
+	}
+	val, _ := raw.(string)
+	return val, nil
+}
+
+func (a *ControlInterface) queryAttributeValueRaw(ctx context.Context, platformElementBytes []byte, attributeName string) (interface{}, bool, error) {
 	elementArg := nskeyedarchiver.NewNSMutableDictionary(map[string]interface{}{
 		"ObjectType": "AXAuditElement_v1",
 		"Value": nskeyedarchiver.NewNSMutableDictionary(map[string]interface{}{
@@ -322,20 +386,41 @@ func (a *ControlInterface) queryAttributeValue(ctx context.Context, platformElem
 
 	response, err := a.channel.MethodCallWithContext(ctx, "deviceElement:valueForAttribute:", elementArg, attributeArg)
 	if err != nil {
-		return "", fmt.Errorf("failed to query %s: %w", attributeName, err)
+		return nil, false, fmt.Errorf("failed to query %s: %w", attributeName, err)
 	}
 
 	// Extract the attribute value from the response payload
 	if len(response.Payload) > 0 {
-		// Response format: [{"ObjectType":"passthrough","Value":"attribute value here"}]
+		// Response format: [{"ObjectType":"passthrough","Value": <string or
+		// archived object>}]. Rect values arrive as archived objects, so
+		// unwrap []byte via nskeyedarchiver before handing them up.
 		if valMap, ok := response.Payload[0].(map[string]interface{}); ok {
-			if val, ok := valMap["Value"].(string); ok {
-				return val, nil
+			if val, present := valMap["Value"]; present {
+				switch v := val.(type) {
+				case string:
+					if v == "" {
+						return nil, false, nil
+					}
+					return v, true, nil
+				case []byte:
+					unarchived, err := nskeyedarchiver.Unarchive(v)
+					if err != nil {
+						return val, true, nil // keep raw bytes rather than dropping
+					}
+					if len(unarchived) == 0 {
+						return nil, false, nil
+					}
+					return unarchived[0], true, nil
+				case nil:
+					return nil, false, nil
+				default:
+					return v, true, nil
+				}
 			}
 		}
 	}
 
-	return "", nil
+	return nil, false, nil
 }
 
 /*
